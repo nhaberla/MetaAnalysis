@@ -36,15 +36,9 @@ When this skill is invoked:
 
 Parse any arguments from the invocation. If `--timeframe` is not given, use `2026-03-13:<today's date>`. Warn the user if the start date is before 2026-03-13 (pre-rotation data uses different card legality and should not be mixed).
 
-### 2. Check dependencies
+### 2. Run the script
 
-Before running, ensure Python dependencies are installed:
-
-```bash
-cd /home/user/MetaAnalysis && pip install -r scripts/requirements.txt -q
-```
-
-### 3. Run the script
+No installation needed — stdlib only (Python 3.8+).
 
 ```bash
 cd /home/user/MetaAnalysis && python scripts/matchup_breakdown.py <args>
@@ -97,3 +91,4 @@ Then send the `.xlsx` file to the user with `SendUserFile`.
 - **Mirror matches**: Excluded from the matrix (always 50/50 by definition at scale).
 - **Low sample**: Any cell with `*` has <20 games. The Vader/Aurra matchup is a known extreme (78% in small samples); treat outliers skeptically.
 - **Event weighting**: The script treats all events equally. For deeper analysis, consider weighting Sector Qualifiers (200-500p) and Regionals (500-700p) more heavily than PQs.
+- **Archetype discovery**: Archetypes are derived purely from tournament data — the script reads each player's leader and base card name from their melee.gg decklist and forms `"Leader / Base"` labels automatically. `--num-decks` controls how many top archetypes (ranked by total game count) appear in the matrix. No deck list is hardcoded.

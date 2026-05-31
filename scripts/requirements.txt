@@ -1,2 +1,2 @@
-requests>=2.31.0
-openpyxl>=3.1.2
+# No external dependencies — uses Python 3.8+ stdlib only.
+# urllib (HTTP), zipfile + xml.sax.saxutils (XLSX writer), json, argparse, collections.
