@@ -16,7 +16,7 @@ Build a SWU matchup matrix using: $ARGUMENTS
 
 2. **Run the script** (stdlib only, no install needed):
    ```
-   python scripts/matchup_breakdown.py --timeframe <timeframe> --num-decks <n> [other args]
+   python ${CLAUDE_SKILL_DIR}/matchup_breakdown.py --timeframe <timeframe> --num-decks <n> [other args]
    ```
    Pass `--verbose` on the first run of a session so API issues surface clearly.
 
