@@ -1,0 +1,9 @@
+{
+  "description": "Star Wars Unlimited meta analysis plugin",
+  "skills": {
+    "matchup-breakdown": {
+      "description": "Build a head-to-head win rate matrix from real melee.gg tournament data",
+      "path": ".claude/skills/matchup-breakdown.md"
+    }
+  }
+}
