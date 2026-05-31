@@ -34,46 +34,6 @@ REQUEST_DELAY = 0.5        # seconds between API calls
 MIN_PLAYERS_DEFAULT = 32   # matches swu-competitivehub.com filter standard
 LOW_SAMPLE_THRESHOLD = 20  # matchups below this count get an asterisk
 
-# ── Demo data (SWU LAW Meta Guide, post-rotation LAW Premier) ─────────────────
-# Used by --demo to validate spreadsheet output without live API calls.
-
-_DEMO_ARCHETYPES = [
-    "Lando Calrissian / Lake Country",
-    "Boba Fett / Lake Country",
-    "Aurra Sing / Data Vault",
-    "Dedra Meero / Colossus",
-    "Obi-Wan Kenobi / Blue Force",
-    "Mother Talzin / Yellow Force",
-    "Chewbacca / Cunning",
-    "Col. Yularen / Aggression",
-    "Darth Vader / Cunning",
-    "Luke Skywalker / Data Vault",
-    "Admiral Piett / Blue",
-    "Tobias Beckett / Red",
-]
-
-# Meta share % per archetype (from the guide) — used to estimate sample sizes.
-# The product of two shares approximates relative matchup frequency.
-_DEMO_META_SHARE = [9.7, 12.9, 3.3, 2.4, 10.2, 5.2, 3.6, 3.6, 3.9, 6.6, 3.7, 2.0]
-
-# Win rate of row archetype vs column archetype (None = mirror).
-# Source: SWU LAW Meta Guide matchup matrix.
-_DEMO_WIN_PCT: List[List[Optional[int]]] = [
-    #        Lando  Boba  Aurra  Dedra  Obi   Talzin Chewb  Yular  Vader  Luke  Piett  Tobias
-    [None,   53,    44,   50,    53,    55,   55,    56,    70,    62,   55,    57  ],  # Lando
-    [47,     None,  45,   50,    65,    53,   52,    55,    55,    58,   54,    56  ],  # Boba
-    [56,     55,    None, 52,    45,    53,   50,    52,    22,    54,   52,    54  ],  # Aurra
-    [50,     50,    48,   None,  54,    52,   50,    54,    55,    57,   53,    55  ],  # Dedra
-    [47,     35,    55,   46,    None,  42,   45,    37,    68,    55,   50,    52  ],  # Obi-Wan
-    [45,     47,    47,   48,    58,    None, 48,    50,    52,    54,   50,    52  ],  # Talzin
-    [45,     48,    50,   50,    57,    52,   None,  52,    55,    56,   52,    53  ],  # Chewbacca
-    [44,     45,    48,   46,    63,    50,   48,    None,  55,    63,   52,    54  ],  # Yularen
-    [30,     45,    78,   45,    32,    48,   45,    45,    None,  55,   50,    52  ],  # Vader
-    [38,     42,    46,   43,    45,    46,   44,    37,    45,    None, 48,    50  ],  # Luke
-    [45,     46,    48,   47,    50,    50,   48,    48,    50,    52,   None,  51  ],  # Piett
-    [43,     44,    46,   45,    48,    48,   47,    46,    48,    50,   49,    None],  # Tobias
-]
-
 # melee.gg game identifier for Star Wars Unlimited.
 # If you see 0 results or a 404, open melee.gg in a browser, start DevTools →
 # Network, navigate to the SWU tournament list, and inspect the XHR request to
@@ -306,44 +266,6 @@ def get_games(
     a: str, b: str, pair_games: "defaultdict[FrozenSet[str], int]"
 ) -> int:
     return pair_games[frozenset({a, b})]
-
-
-# ── Demo data builder ─────────────────────────────────────────────────────────
-
-def _build_demo_data(
-    top_n: int,
-) -> Tuple[
-    "defaultdict[Tuple[str, str], int]",
-    "defaultdict[FrozenSet[str], int]",
-    List[str],
-]:
-    """
-    Populate wins/pair_games from the guide's matchup matrix.
-
-    Sample sizes are estimated as max(8, round(share_a * share_b * 0.8)).
-    This naturally mirrors reality: high-meta-share matchups get ~100 games
-    (full colour coding) while fringe-vs-fringe matchups fall below
-    LOW_SAMPLE_THRESHOLD and render with an asterisk.
-    """
-    wins: "defaultdict[Tuple[str, str], int]" = defaultdict(int)
-    pair_games: "defaultdict[FrozenSet[str], int]" = defaultdict(int)
-    n = min(top_n, len(_DEMO_ARCHETYPES))
-    archetypes = _DEMO_ARCHETYPES[:n]
-
-    for i, arch_a in enumerate(archetypes):
-        for j, arch_b in enumerate(archetypes):
-            if i >= j:
-                continue
-            wr_a = _DEMO_WIN_PCT[i][j]
-            if wr_a is None:
-                continue
-            n_games = max(8, round(_DEMO_META_SHARE[i] * _DEMO_META_SHARE[j] * 0.8))
-            wins_a = round(wr_a / 100 * n_games)
-            wins[(arch_a, arch_b)] = wins_a
-            wins[(arch_b, arch_a)] = n_games - wins_a
-            pair_games[frozenset({arch_a, arch_b})] = n_games
-
-    return wins, pair_games, archetypes
 
 
 # ── Minimal stdlib XLSX writer ────────────────────────────────────────────────
@@ -627,15 +549,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--timeframe", default=None, metavar="YYYY-MM-DD:YYYY-MM-DD",
-                   help="Date range for live data. Required unless --demo is used.")
+    p.add_argument("--timeframe", required=True, metavar="YYYY-MM-DD:YYYY-MM-DD")
     p.add_argument("--num-decks", type=int, default=12,
                    help="Top N archetypes by game count (default: 12).")
     p.add_argument("--min-players", type=int, default=MIN_PLAYERS_DEFAULT,
                    help=f"Minimum event size (default: {MIN_PLAYERS_DEFAULT}).")
     p.add_argument("--output", default="matchup_matrix.xlsx")
-    p.add_argument("--demo", action="store_true",
-                   help="Use guide data instead of live API calls. Validates spreadsheet output.")
     p.add_argument("--dry-run", action="store_true",
                    help="List qualifying tournaments; skip match data fetch.")
     p.add_argument("--verbose", "-v", action="store_true")
@@ -644,24 +563,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
-    # ── Demo mode — skip all API calls ────────────────────────────────────────
-    if args.demo:
-        print(f"Demo mode: using SWU LAW Meta Guide matchup matrix (top {args.num_decks} archetypes)\n")
-        wins, pair_games, archetypes = _build_demo_data(args.num_decks)
-        total_match_count = sum(pair_games.values())
-        print(f"Archetypes ({len(archetypes)}):")
-        for i, arch in enumerate(archetypes, 1):
-            g = sum(get_games(arch, other, pair_games) for other in archetypes if other != arch)
-            print(f"  {i:2}.  {arch:<45}  {g} matchup games")
-        write_xlsx(
-            archetypes, wins, pair_games, args.output,
-            "DEMO", "SWU LAW Meta Guide", 0, total_match_count,
-        )
-        return
-
-    if not args.timeframe:
-        sys.exit("Error: --timeframe is required unless --demo is used.")
 
     try:
         start_str, end_str = args.timeframe.split(":")
