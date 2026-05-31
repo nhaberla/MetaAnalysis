@@ -23,7 +23,7 @@ import urllib.request
 import xml.sax.saxutils
 import zipfile
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -549,9 +549,10 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--timeframe", required=True, metavar="YYYY-MM-DD:YYYY-MM-DD")
-    p.add_argument("--num-decks", type=int, default=12,
-                   help="Top N archetypes by game count (default: 12).")
+    p.add_argument("--timeframe", default=None, metavar="YYYY-MM-DD:YYYY-MM-DD",
+                   help="Date range (default: last 30 days).")
+    p.add_argument("--num-decks", type=int, default=10,
+                   help="Top N archetypes by game count (default: 10).")
     p.add_argument("--min-players", type=int, default=MIN_PLAYERS_DEFAULT,
                    help=f"Minimum event size (default: {MIN_PLAYERS_DEFAULT}).")
     p.add_argument("--output", default="matchup_matrix.xlsx")
@@ -564,12 +565,17 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    try:
-        start_str, end_str = args.timeframe.split(":")
-        start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d").date()
-        end_date = datetime.strptime(end_str.strip(), "%Y-%m-%d").date()
-    except ValueError:
-        sys.exit("Error: --timeframe must be YYYY-MM-DD:YYYY-MM-DD")
+    today = datetime.now().date()
+    if args.timeframe is None:
+        start_date = today - timedelta(days=30)
+        end_date = today
+    else:
+        try:
+            start_str, end_str = args.timeframe.split(":")
+            start_date = datetime.strptime(start_str.strip(), "%Y-%m-%d").date()
+            end_date = datetime.strptime(end_str.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            sys.exit("Error: --timeframe must be YYYY-MM-DD:YYYY-MM-DD")
 
     if str(start_date) < POST_ROTATION_DATE:
         print(

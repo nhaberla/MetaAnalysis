@@ -9,8 +9,8 @@ Build a SWU matchup matrix using: $ARGUMENTS
 ## Steps
 
 1. **Resolve arguments from `$ARGUMENTS`.**
-   - `--timeframe`: default `2026-03-13:` + today's date above. Warn if start date is before `2026-03-13` (pre-rotation data uses different card legality).
-   - `--num-decks`: default `12`.
+   - `--timeframe`: default is the last 30 days (computed by the script at runtime). Warn if start date is before `2026-03-13` (pre-rotation data uses different card legality).
+   - `--num-decks`: default `10`.
    - `--min-players`: default `32`.
    - `--output`: default `matchup_matrix.xlsx`.
 
