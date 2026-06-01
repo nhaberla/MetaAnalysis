@@ -2,9 +2,9 @@
 """
 SWU Matchup Breakdown — stdlib only, no external dependencies.
 
-Fetches real game-by-game results from melee.gg and builds a color-coded
+Scrapes public melee.gg pages (no API key required) and builds a color-coded
 head-to-head win rate matrix spreadsheet for the Star Wars Unlimited meta.
-Archetypes are discovered dynamically from tournament decklist data.
+Archetypes are discovered dynamically from DecklistName fields in match data.
 
 Usage:
     python matchup_breakdown.py --timeframe 2026-03-13:2026-05-31 --num-decks 12
@@ -15,6 +15,7 @@ Usage:
 import argparse
 import io
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -28,150 +29,252 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MELEE_API = "https://melee.gg/api/v1"
+MELEE_BASE = "https://melee.gg"
 POST_ROTATION_DATE = "2026-03-13"
-REQUEST_DELAY = 0.5        # seconds between API calls
+REQUEST_DELAY = 1.0        # seconds between requests (respects robots.txt crawl delay)
 MIN_PLAYERS_DEFAULT = 32   # matches swu-competitivehub.com filter standard
 LOW_SAMPLE_THRESHOLD = 20  # matchups below this count get an asterisk
 
-# melee.gg game identifier for Star Wars Unlimited.
-# If you see 0 results or a 404, open melee.gg in a browser, start DevTools →
-# Network, navigate to the SWU tournament list, and inspect the XHR request to
-# find the current value. It may be a string slug or a numeric gameId.
-SWU_GAME_SLUG = "sw-unlimited"
+# DataTables column names used by /Match/GetRoundMatches (must match pairings-section.min.js)
+_MATCH_COLUMNS = ["TableNumber", "PodNumber", "Teams", "Decklists", "ResultString"]
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 _HTTP_CACHE: Dict[str, object] = {}
+_BASE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
-def _http_get(url: str, params: Optional[dict] = None, verbose: bool = False) -> object:
-    if params:
-        url = f"{url}?{urllib.parse.urlencode(params)}"
+def _get_html(path: str, verbose: bool = False) -> str:
+    url = MELEE_BASE + path
     if url in _HTTP_CACHE:
-        return _HTTP_CACHE[url]
+        return _HTTP_CACHE[url]  # type: ignore[return-value]
     time.sleep(REQUEST_DELAY)
     if verbose:
         print(f"  GET {url}", file=sys.stderr)
     req = urllib.request.Request(url, headers={
-        "User-Agent": "SWU-MetaAnalysis/1.0",
-        "Accept": "application/json",
+        **_BASE_HEADERS,
+        "Accept": "text/html,application/xhtml+xml",
+        "Referer": MELEE_BASE + "/",
     })
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read().decode())
-    _HTTP_CACHE[url] = data
-    return data
+    with urllib.request.urlopen(req, timeout=20) as r:
+        html = r.read().decode("utf-8", errors="replace")
+    _HTTP_CACHE[url] = html
+    return html
 
 
-def _unwrap(data: object) -> list:
-    """Extract the list payload from common melee.gg envelope shapes."""
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("data", "tournaments", "rounds", "pairings"):
-            if key in data and isinstance(data[key], list):
-                return data[key]
-    return []
+def _post_json(path: str, params: list, verbose: bool = False) -> object:
+    url = MELEE_BASE + path
+    data = urllib.parse.urlencode(params).encode()
+    if verbose:
+        shown = [(k, v) for k, v in params if not k.startswith("columns")]
+        print(f"  POST {url} {dict(shown)}", file=sys.stderr)
+    time.sleep(REQUEST_DELAY)
+    req = urllib.request.Request(url, data=data, headers={
+        **_BASE_HEADERS,
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": MELEE_BASE + "/",
+    })
+    with urllib.request.urlopen(req, timeout=20) as r:
+        body = r.read()
+    if body.strip().startswith(b"<"):
+        raise RuntimeError(
+            f"melee.gg returned HTML instead of JSON for POST {path}. "
+            "The endpoint may have changed or require authentication."
+        )
+    return json.loads(body)
+
+
+def _dt_params(start: int = 0, length: int = 250) -> list:
+    """DataTables POST params for /Match/GetRoundMatches (flat keys)."""
+    params = [
+        ("draw", "1"), ("start", str(start)), ("length", str(length)),
+        ("order[0][column]", "0"), ("order[0][dir]", "asc"),
+        ("search[value]", ""), ("search[regex]", "false"),
+    ]
+    for i, col in enumerate(_MATCH_COLUMNS):
+        params += [
+            (f"columns[{i}][data]", col),
+            (f"columns[{i}][name]", ""),
+            (f"columns[{i}][searchable]", "true"),
+            (f"columns[{i}][orderable]", "true"),
+            (f"columns[{i}][search][value]", ""),
+            (f"columns[{i}][search][regex]", "false"),
+        ]
+    return params
+
+
+def _search_dt_params(start: int = 0, length: int = 250) -> list:
+    """DataTables POST params for /Tournament/TournamentSearch (variables[...] keys)."""
+    return [
+        ("variables[draw]", "1"),
+        ("variables[start]", str(start)),
+        ("variables[length]", str(length)),
+        ("variables[order][0][column]", "0"),
+        ("variables[order][0][dir]", "asc"),
+        ("variables[search][value]", ""),
+        ("variables[search][regex]", "false"),
+    ]
 
 
 # ── Tournament fetching ───────────────────────────────────────────────────────
+
+def _t_id(t: dict) -> int:
+    return int(t.get("id") or t.get("ID") or 0)
+
+def _t_name(t: dict) -> str:
+    return str(t.get("name") or t.get("Name") or "Unnamed")
+
+def _t_players(t: dict) -> int:
+    return int(t.get("enrolledPlayerCount") or t.get("playerCount") or 0)
+
+def _t_date(t: dict) -> str:
+    return str(t.get("startDate") or t.get("StartDate") or "")[:10]
+
 
 def fetch_tournaments(
     start_date: str, end_date: str, min_players: int, verbose: bool
 ) -> List[dict]:
     """
-    Return all SWU Premier tournaments in the date range with >= min_players.
+    Return all SWU Premier ended tournaments in the date range with >= min_players.
 
-    melee.gg API (reverse-engineered by community tools):
-        GET /api/v1/Tournaments
-        params: game, startDate, endDate, pageSize, pageNumber, format
+    Uses POST /Tournament/TournamentSearch — no API key required.
+    Filters: Ended + Premier (server-side); date range and player count are client-side.
+    Paginates from near the end of the sorted result set to find recent events.
     """
+    search_params_base = [
+        ("ordering", "StartDate"), ("mode", "Table"),
+        ("filters[]", "Ended"), ("filters[]", "Premier"),
+    ]
+
+    # Get total record count first (one cheap request)
+    probe = _post_json("/Tournament/TournamentSearch",
+                       search_params_base + _search_dt_params(0, 25), verbose=verbose)
+    total = int(probe.get("recordsTotal") or 0)  # type: ignore[union-attr]
+    if verbose:
+        print(f"  Total Ended+Premier SWU events indexed: {total}", file=sys.stderr)
+
+    # Estimate how far back we need to go: ~36 events/day is conservative
+    days = max(1, (datetime.strptime(end_date, "%Y-%m-%d") -
+                   datetime.strptime(start_date, "%Y-%m-%d")).days)
+    fetch_window = max(500, days * 50)
+    start_offset = max(0, total - fetch_window)
+
     results: List[dict] = []
-    page, page_size = 1, 50
+    batch_size = 250
 
-    while True:
-        try:
-            raw = _http_get(f"{MELEE_API}/Tournaments", params={
-                "game": SWU_GAME_SLUG,
-                "startDate": start_date,
-                "endDate": end_date,
-                "pageSize": page_size,
-                "pageNumber": page,
-                "format": "Premier",
-            }, verbose=verbose)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                raise RuntimeError(
-                    f"melee.gg returned 404. SWU_GAME_SLUG='{SWU_GAME_SLUG}' may be wrong.\n"
-                    f"Inspect melee.gg XHR traffic to find the correct game filter value."
-                ) from exc
-            raise
-
-        items = _unwrap(raw)
+    while start_offset <= total:
+        resp = _post_json("/Tournament/TournamentSearch",
+                          search_params_base + _search_dt_params(start_offset, batch_size),
+                          verbose=verbose)
+        items = resp.get("data", [])  # type: ignore[union-attr]
         if not items:
             break
+
         for t in items:
-            count = int(t.get("playerCount") or t.get("registrations") or 0)
-            if count >= min_players:
+            d = _t_date(t)
+            if d < start_date or d > end_date:
+                continue
+            if _t_players(t) >= min_players:
                 results.append(t)
-        if len(items) < page_size:
-            break
-        page += 1
+
+        start_offset += batch_size
 
     return results
 
 
 # ── Archetype discovery ───────────────────────────────────────────────────────
 
-def _clean(name: str) -> str:
-    return " ".join(name.split()) if name else "Unknown"
-
-
-def fetch_archetype(decklist_id: str, verbose: bool) -> Optional[Tuple[str, str]]:
+def parse_decklist_name(name: str) -> Optional[Tuple[str, str]]:
     """
-    Fetch a decklist from melee.gg and return (leader_name, base_name).
+    Parse 'Leader Name, Subtitle - Base Name' into (leader, base).
 
-    Each SWU deck has exactly one Leader and one Base card. melee.gg may
-    expose these as top-level dict fields or inside a 'cards' / 'mainDeck'
-    array. Both shapes are tried.
+    melee.gg stores the archetype directly in DecklistName as 'Leader - Base'.
+    We split on the last ' - ' to handle leaders whose subtitles contain dashes.
     """
-    try:
-        dl = _http_get(f"{MELEE_API}/Decklists/{decklist_id}", verbose=verbose)
-    except urllib.error.HTTPError:
+    if not name:
         return None
-    if not isinstance(dl, dict):
+    sep = " - "
+    idx = name.rfind(sep)
+    if idx < 0:
         return None
-
-    leader, base = "", ""
-
-    if isinstance(dl.get("leader"), dict):
-        leader = _clean(dl["leader"].get("name", ""))
-    if isinstance(dl.get("base"), dict):
-        base = _clean(dl["base"].get("name", ""))
-
+    leader = name[:idx].strip()
+    base = name[idx + len(sep):].strip()
     if not leader or not base:
-        for card in (dl.get("cards") or dl.get("mainDeck") or []):
-            ctype = (card.get("type") or card.get("cardType") or "").lower()
-            if ctype == "leader" and not leader:
-                leader = _clean(card.get("name", ""))
-            elif ctype == "base" and not base:
-                base = _clean(card.get("name", ""))
-
-    return (leader or "Unknown", base or "Unknown") if (leader or base) else None
+        return None
+    return leader, base
 
 
 def archetype_label(leader: str, base: str) -> str:
     return f"{leader} / {base}"
 
 
-# ── Match processing ──────────────────────────────────────────────────────────
+# ── Round and match fetching ──────────────────────────────────────────────────
 
-def _is_top_cut(rnd: dict) -> bool:
-    rtype = (rnd.get("type") or rnd.get("roundType") or "").lower()
-    return rnd.get("isTopCut", False) or rtype in (
-        "top8", "top4", "top2", "final", "semifinal", "quarterfinal"
+def _is_swiss_round_name(name: str) -> bool:
+    """Swiss rounds are named 'Round N'; top-cut rounds have descriptive names."""
+    return bool(re.match(r"^Round\s+\d+$", name.strip(), re.IGNORECASE))
+
+
+def fetch_swiss_round_ids(tournament_id: int, verbose: bool) -> Tuple[List[str], bool]:
+    """
+    Parse /Tournament/View/{id} HTML to extract Swiss round IDs and decklist visibility.
+    Returns (swiss_round_ids, decklist_enabled).
+    """
+    html = _get_html(f"/Tournament/View/{tournament_id}", verbose=verbose)
+
+    # Round selector buttons: <button ... data-id="NNN" data-name="Round N">
+    round_buttons = re.findall(
+        r'<button[^>]+class="[^"]*round-selector[^"]*"[^>]*'
+        r'data-id="(\d+)"[^>]*data-name="([^"]+)"',
+        html,
     )
+    # Also try with attributes in reversed order
+    if not round_buttons:
+        round_buttons = [
+            (rid, name)
+            for name, rid in re.findall(
+                r'<button[^>]+data-name="([^"]+)"[^>]+data-id="(\d+)"', html
+            )
+        ]
 
+    swiss_ids = [rid for rid, name in round_buttons if _is_swiss_round_name(name)]
+
+    dl_match = re.search(r'name="DecklistEnabled"[^>]+value="([^"]+)"', html)
+    decklist_enabled = bool(dl_match and dl_match.group(1).lower() == "true")
+
+    if verbose:
+        all_names = [name for _, name in round_buttons]
+        print(f"  [debug] rounds: {all_names} | decklists: {decklist_enabled}", file=sys.stderr)
+
+    return swiss_ids, decklist_enabled
+
+
+def fetch_round_matches(round_id: str, verbose: bool) -> List[dict]:
+    """Fetch all matches for a round via POST /Match/GetRoundMatches/{roundId}."""
+    all_matches: List[dict] = []
+    start = 0
+    while True:
+        resp = _post_json(f"/Match/GetRoundMatches/{round_id}", _dt_params(start, 250),
+                          verbose=verbose)
+        batch = resp.get("data", [])  # type: ignore[union-attr]
+        all_matches.extend(batch)
+        total = int(resp.get("recordsTotal") or 0)  # type: ignore[union-attr]
+        if len(all_matches) >= total or not batch:
+            break
+        start += 250
+    return all_matches
+
+
+# ── Match processing ──────────────────────────────────────────────────────────
 
 def process_tournament(
     tournament: dict,
@@ -180,63 +283,64 @@ def process_tournament(
     verbose: bool,
 ) -> int:
     """
-    Walk all Swiss rounds of a tournament. For each completed pairing, resolve
-    both players' archetypes from their decklists and record the result.
+    Fetch Swiss round matches for a tournament. For each completed head-to-head,
+    extract archetypes from DecklistName and record the result.
     Returns the number of matchup records added.
     """
-    tid = str(tournament.get("id") or tournament.get("tournamentId", ""))
-
-    try:
-        raw_rounds = _http_get(f"{MELEE_API}/Tournaments/{tid}/Rounds", verbose=verbose)
-    except urllib.error.HTTPError:
+    tid = _t_id(tournament)
+    if not tid:
         return 0
 
-    swiss_rounds = [r for r in _unwrap(raw_rounds) if not _is_top_cut(r)]
-    player_arch: Dict[str, Optional[str]] = {}  # player_id → "Leader / Base"
-    added = 0
+    swiss_round_ids, decklist_enabled = fetch_swiss_round_ids(tid, verbose)
 
-    for rnd in swiss_rounds:
-        rid = str(rnd.get("id") or rnd.get("roundId", ""))
+    if not decklist_enabled:
+        if verbose:
+            print(f"  [skip] {_t_name(tournament)}: decklists not public", file=sys.stderr)
+        return 0
+
+    if not swiss_round_ids:
+        if verbose:
+            print(f"  [skip] {_t_name(tournament)}: no Swiss rounds found", file=sys.stderr)
+        return 0
+
+    added = 0
+    for round_id in swiss_round_ids:
         try:
-            raw_pairings = _http_get(
-                f"{MELEE_API}/Pairings", params={"roundId": rid}, verbose=verbose
-            )
-        except urllib.error.HTTPError:
+            matches = fetch_round_matches(round_id, verbose)
+        except Exception as exc:
+            if verbose:
+                print(f"  [warn] round {round_id}: {exc}", file=sys.stderr)
             continue
 
-        for p in _unwrap(raw_pairings):
-            p1_id = str(p.get("player1Id") or p.get("teamOneId") or "")
-            p2_id = str(p.get("player2Id") or p.get("teamTwoId") or "")
-            p1_score = int(p.get("player1Score") or p.get("teamOneScore") or 0)
-            p2_score = int(p.get("player2Score") or p.get("teamTwoScore") or 0)
+        for m in matches:
+            comps = m.get("Competitors", [])
+            if len(comps) != 2 or not m.get("HasResult"):
+                continue  # bye or unfinished
 
-            if not p1_id or not p2_id or p1_score == p2_score:
-                continue  # skip byes and draws
+            c1, c2 = comps
+            w1 = int(c1.get("GameWins") or 0)
+            w2 = int(c2.get("GameWins") or 0)
+            if w1 == w2:
+                continue  # draw
 
-            winner_id = p1_id if p1_score > p2_score else p2_id
-            loser_id = p2_id if winner_id == p1_id else p1_id
+            winner, loser = (c1, c2) if w1 > w2 else (c2, c1)
 
-            for pid, side in [(p1_id, "player1"), (p2_id, "player2")]:
-                if pid in player_arch:
-                    continue
-                dl_id = str(
-                    p.get(f"{side}DecklistId")
-                    or p.get(f"team{'One' if side == 'player1' else 'Two'}DecklistId")
-                    or ""
-                )
-                if dl_id:
-                    pair = fetch_archetype(dl_id, verbose)
-                    player_arch[pid] = archetype_label(*pair) if pair else None
-                else:
-                    player_arch[pid] = None
+            dl_w = (winner.get("Decklists") or [{}])[0]
+            dl_l = (loser.get("Decklists") or [{}])[0]
 
-            w_arch = player_arch.get(winner_id)
-            l_arch = player_arch.get(loser_id)
+            w_pair = parse_decklist_name(dl_w.get("DecklistName", ""))
+            l_pair = parse_decklist_name(dl_l.get("DecklistName", ""))
+            if not w_pair or not l_pair:
+                continue
 
-            if w_arch and l_arch and w_arch != l_arch:
-                wins[(w_arch, l_arch)] += 1
-                pair_games[frozenset({w_arch, l_arch})] += 1
-                added += 1
+            w_arch = archetype_label(*w_pair)
+            l_arch = archetype_label(*l_pair)
+            if w_arch == l_arch:
+                continue  # mirror
+
+            wins[(w_arch, l_arch)] += 1
+            pair_games[frozenset({w_arch, l_arch})] += 1
+            added += 1
 
     return added
 
@@ -322,7 +426,7 @@ _STYLES_XML = """\
   </cellStyleXfs>
   <cellXfs count="14">
     <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"><alignment horizontal="center" vertical="center"/></xf>
-    <xf numFmtId="0" fontId="2" fillId="2" borderId="0" xfId="0"><alignment horizontal="center" vertical="bottom" textRotation="45"/></xf>
+    <xf numFmtId="0" fontId="2" fillId="2" borderId="0" xfId="0"><alignment horizontal="center" vertical="bottom" textRotation="90"/></xf>
     <xf numFmtId="0" fontId="2" fillId="2" borderId="0" xfId="0"><alignment horizontal="left" vertical="center"/></xf>
     <xf numFmtId="0" fontId="3" fillId="3" borderId="0" xfId="0"><alignment horizontal="center" vertical="center"/></xf>
     <xf numFmtId="0" fontId="1" fillId="4" borderId="0" xfId="0"><alignment horizontal="center" vertical="center"/></xf>
@@ -345,6 +449,7 @@ _CONTENT_TYPES = (
     '<Default Extension="xml" ContentType="application/xml"/>'
     '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
     '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+    '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
     '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
     '</Types>'
 )
@@ -360,7 +465,10 @@ _WORKBOOK = (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
     ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-    '<sheets><sheet name="Matchup Matrix" sheetId="1" r:id="rId1"/></sheets>'
+    '<sheets>'
+    '<sheet name="Matchup Matrix" sheetId="1" r:id="rId1"/>'
+    '<sheet name="Matchup Counts" sheetId="2" r:id="rId2"/>'
+    '</sheets>'
     '</workbook>'
 )
 
@@ -368,7 +476,8 @@ _WORKBOOK_RELS = (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
     '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>'
+    '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
     '</Relationships>'
 )
 
@@ -514,6 +623,78 @@ def _build_sheet_xml(
     )
 
 
+def _build_counts_sheet_xml(
+    archetypes: List[str],
+    pair_games: "defaultdict[FrozenSet[str], int]",
+    start_date: str,
+    end_date: str,
+    tournament_count: int,
+    total_match_count: int,
+) -> str:
+    n = len(archetypes)
+    total_col = n + 2
+    rows: List[str] = []
+
+    title = (
+        f"SWU Matchup Counts | {start_date} – {end_date} | "
+        f"{tournament_count} events | {total_match_count} matchups | top {n} archetypes"
+    )
+    rows.append(f'<row r="1" ht="20" customHeight="1">{_cell("A1", title, _S_TITLE)}</row>')
+
+    header_cells = [_cell("A2", "Deck ↓  vs  →", _S_ROW_LABEL)]
+    for ci, arch in enumerate(archetypes, start=2):
+        header_cells.append(_cell(f"{_col_letter(ci)}2", arch.split(" / ")[0], _S_COL_HEADER))
+    header_cells.append(_cell(f"{_col_letter(total_col)}2", "Total", _S_AVG_HDR))
+    rows.append(f'<row r="2" ht="55" customHeight="1">{"".join(header_cells)}</row>')
+
+    for ri, row_arch in enumerate(archetypes, start=3):
+        cells = [_cell(f"A{ri}", row_arch, _S_ROW_LABEL)]
+        row_total = 0
+        for ci, col_arch in enumerate(archetypes, start=2):
+            ref = f"{_col_letter(ci)}{ri}"
+            if row_arch == col_arch:
+                cells.append(_cell(ref, "—", _S_MIRROR))
+                continue
+            g = get_games(row_arch, col_arch, pair_games)
+            if g == 0:
+                cells.append(_cell(ref, "—", _S_NO_DATA))
+            else:
+                cells.append(_cell(ref, g, _S_DEFAULT))
+                row_total += g
+        total_ref = f"{_col_letter(total_col)}{ri}"
+        cells.append(_cell(total_ref, row_total if row_total else "—",
+                           _S_AVG_HDR if row_total else _S_MIRROR))
+        rows.append(f'<row r="{ri}">{"".join(cells)}</row>')
+
+    note_row = n + 5
+    rows.append(
+        f'<row r="{note_row}">'
+        f'{_cell(f"A{note_row}", "Game counts from Swiss rounds only. Mirror matches excluded.", _S_NO_DATA)}'
+        f'</row>'
+    )
+
+    cols_xml = (
+        f'<cols>'
+        f'<col min="1" max="1" width="33" customWidth="1"/>'
+        f'<col min="2" max="{n + 1}" width="7" customWidth="1"/>'
+        f'<col min="{n + 2}" max="{n + 2}" width="9" customWidth="1"/>'
+        f'</cols>'
+    )
+    freeze_xml = (
+        '<sheetViews><sheetView workbookViewId="0">'
+        '<pane xSplit="1" ySplit="2" topLeftCell="B3" activePane="bottomRight" state="frozen"/>'
+        '</sheetView></sheetViews>'
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        + freeze_xml
+        + cols_xml
+        + f'<sheetData>{"".join(rows)}</sheetData>'
+        + '</worksheet>'
+    )
+
+
 def write_xlsx(
     archetypes: List[str],
     wins: "defaultdict[Tuple[str, str], int]",
@@ -524,8 +705,12 @@ def write_xlsx(
     tournament_count: int,
     total_match_count: int,
 ) -> None:
-    sheet_xml = _build_sheet_xml(
+    sheet1_xml = _build_sheet_xml(
         archetypes, wins, pair_games,
+        start_date, end_date, tournament_count, total_match_count,
+    )
+    sheet2_xml = _build_counts_sheet_xml(
+        archetypes, pair_games,
         start_date, end_date, tournament_count, total_match_count,
     )
     buf = io.BytesIO()
@@ -535,7 +720,8 @@ def write_xlsx(
         zf.writestr("xl/workbook.xml", _WORKBOOK)
         zf.writestr("xl/_rels/workbook.xml.rels", _WORKBOOK_RELS)
         zf.writestr("xl/styles.xml", _STYLES_XML)
-        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet1_xml)
+        zf.writestr("xl/worksheets/sheet2.xml", sheet2_xml)
     with open(output_path, "wb") as f:
         f.write(buf.getvalue())
     print(f"Saved: {output_path}")
@@ -563,6 +749,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # Ensure UTF-8 output on Windows where the default cp1252 codec can't
+    # encode the special characters used in progress/summary lines.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     args = parse_args()
 
     today = datetime.now().date()
@@ -596,24 +789,25 @@ def main() -> None:
     except urllib.error.URLError as exc:
         sys.exit(
             f"\nNetwork error: {exc}\n"
-            f"Possible causes:\n"
-            f"  • No internet access in this environment\n"
-            f"  • melee.gg is temporarily unavailable\n"
-            f"  • melee.gg requires session authentication for API access\n"
-            f"If running in a restricted environment, run this script locally instead.\n"
+            "Possible causes:\n"
+            "  • No internet access in this environment\n"
+            "  • melee.gg is temporarily unavailable\n"
+            "If running in a restricted environment, run this script locally instead.\n"
         )
 
     if not tournaments:
         sys.exit(
-            f"No tournaments found (game='{SWU_GAME_SLUG}', {start_date}–{end_date}).\n"
-            f"Check SWU_GAME_SLUG or widen the date range.\n"
+            f"No SWU Premier tournaments found ({start_date} to {end_date}, min {args.min_players} players).\n"
+            "Possible causes:\n"
+            "  • No events in the date range — try widening --timeframe\n"
+            "  • Game/format client-side filtering is too strict (try --verbose to see raw data)\n"
         )
 
     print(f"Found {len(tournaments)} qualifying tournament(s):\n")
-    for t in sorted(tournaments, key=lambda x: x.get("date") or x.get("startDate") or ""):
-        count = t.get("playerCount") or t.get("registrations") or "?"
-        d = t.get("date") or t.get("startDate") or "unknown date"
-        print(f"  • {t.get('name', 'Unnamed'):<55}  {count!s:>4} players  {d}")
+    for t in sorted(tournaments, key=_t_date):
+        count = _t_players(t)
+        d = _t_date(t)
+        print(f"  • {_t_name(t):<55}  {count:>4} players  {d}")
 
     if args.dry_run:
         print("\nDry run complete. Re-run without --dry-run to process match data.")
@@ -626,7 +820,7 @@ def main() -> None:
 
     print(f"\nProcessing match results ({len(tournaments)} events)...\n")
     for t in tournaments:
-        name = t.get("name", "Unnamed")
+        name = _t_name(t)
         try:
             added = process_tournament(t, wins, pair_games, args.verbose)
             total_match_count += added
@@ -638,12 +832,10 @@ def main() -> None:
         sys.exit(
             "\nNo match data collected.\n"
             "Possible causes:\n"
-            "  • melee.gg pairings/decklists may not be publicly accessible\n"
-            "  • Pairing API endpoint may have changed (try --verbose)\n"
-            "  • Authentication may be required\n"
+            "  • All qualifying tournaments had decklists disabled (not made public by organizer)\n"
+            "  • melee.gg page structure may have changed (try --verbose)\n"
             "\nFallback options:\n"
-            "  • Ask a tournament organiser for a melee.gg export CSV\n"
-            "  • Check swu-competitivehub.com for structured tournament data\n"
+            "  • Widen the date range to include more events\n"
             "  • Use swumetastats.com/api-docs for aggregated (not raw) matchup data\n"
         )
 
