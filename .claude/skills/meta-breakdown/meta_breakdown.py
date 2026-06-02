@@ -603,6 +603,7 @@ def _build_data_sheet_xml(
     archetypes_with_other: List[str],
     weeks: List[str],
     shares: Dict[str, Dict[str, float]],
+    overall_shares: Dict[str, float],
     start_date: str,
     end_date: str,
     tournament_count: int,
@@ -611,6 +612,7 @@ def _build_data_sheet_xml(
 ) -> str:
     n_weeks = len(weeks)
     n_archs = len(archetypes_with_other)
+    overall_col = n_weeks + 2  # 1-based column index for "Overall %"
     rows: List[str] = []
 
     # Row 1: title
@@ -622,10 +624,11 @@ def _build_data_sheet_xml(
     )
     rows.append(f'<row r="1" ht="20" customHeight="1">{_cell("A1", title, _S_TITLE)}</row>')
 
-    # Row 2: column headers (week labels)
+    # Row 2: column headers (week labels) + "Overall %" header
     header_cells = [_cell("A2", "Deck / Week", _S_COL_HDR)]
     for ci, week in enumerate(weeks, start=2):
         header_cells.append(_cell(f"{_col_letter(ci)}2", _format_week_label(week), _S_COL_HDR))
+    header_cells.append(_cell(f"{_col_letter(overall_col)}2", "Overall %", _S_COL_HDR))
     rows.append(f'<row r="2" ht="48" customHeight="1">{"".join(header_cells)}</row>')
 
     # Data rows: one per archetype, "Other" last
@@ -637,6 +640,8 @@ def _build_data_sheet_xml(
         for ci, week in enumerate(weeks, start=2):
             val = round(shares.get(arch, {}).get(week, 0.0), 2)
             cells.append(_cell(f"{_col_letter(ci)}{ri}", val, num_style))
+        overall_val = round(overall_shares.get(arch, 0.0), 2)
+        cells.append(_cell(f"{_col_letter(overall_col)}{ri}", overall_val, num_style))
         rows.append(f'<row r="{ri}">{"".join(cells)}</row>')
 
     # Footer note
@@ -654,6 +659,7 @@ def _build_data_sheet_xml(
         f'<cols>'
         f'<col min="1" max="1" width="42" customWidth="1"/>'
         f'<col min="2" max="{n_weeks + 1}" width="9" customWidth="1"/>'
+        f'<col min="{overall_col}" max="{overall_col}" width="11" customWidth="1"/>'
         f'</cols>'
     )
     freeze_xml = (
@@ -802,6 +808,7 @@ def write_xlsx(
     archetypes_with_other: List[str],
     weeks: List[str],
     shares: Dict[str, Dict[str, float]],
+    overall_shares: Dict[str, float],
     output_path: str,
     start_date: str,
     end_date: str,
@@ -816,7 +823,7 @@ def write_xlsx(
     )
 
     data_sheet = _build_data_sheet_xml(
-        archetypes_with_other, weeks, shares,
+        archetypes_with_other, weeks, shares, overall_shares,
         start_date, end_date, tournament_count, total_entries, locality_label,
     )
     chart_xml = _build_chart_xml(archetypes_with_other, weeks, shares, chart_title)
@@ -917,7 +924,7 @@ def write_xlsx(
         '</xdr:nvGraphicFramePr>'
         '<xdr:xfrm>'
         '<a:off x="0" y="0"/>'
-        '<a:ext cx="0" cy="0"/>'
+        '<a:ext cx="5486400" cy="3657600"/>'
         '</xdr:xfrm>'
         '<a:graphic>'
         '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">'
@@ -1127,6 +1134,11 @@ def main() -> None:
 
     other_total = grand_total - sum(grand_totals[a] for a in top_archs)
     other_pct = other_total / grand_total * 100 if grand_total else 0.0
+    overall_shares: Dict[str, float] = {
+        arch: grand_totals.get(arch, 0) / grand_total * 100 if grand_total else 0.0
+        for arch in top_archs
+    }
+    overall_shares["Other"] = other_pct
     print(f"\n  Other (all remaining decks):  {other_pct:.1f}%  ({other_total} entries)")
     if other_pct > 20:
         print(f"  ⚠  'Other' is large ({other_pct:.1f}%). Consider --num-decks {args.num_decks + 5}.")
@@ -1147,7 +1159,7 @@ def main() -> None:
 
     # ── Write spreadsheet ──────────────────────────────────────────────────────
     write_xlsx(
-        archetypes_with_other, weeks, shares,
+        archetypes_with_other, weeks, shares, overall_shares,
         args.output, str(start_date), str(end_date),
         len(tournaments), total_entries, locality_label,
     )
