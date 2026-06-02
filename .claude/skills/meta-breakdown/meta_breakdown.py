@@ -14,6 +14,7 @@ Usage:
 import argparse
 import io
 import json
+import math
 import re
 import sys
 import time
@@ -29,9 +30,12 @@ from typing import Dict, List, Optional, Tuple
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 MELEE_BASE = "https://melee.gg"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"  # free place-name geocoder
 POST_ROTATION_DATE = "2026-03-13"
 REQUEST_DELAY = 1.0        # seconds between requests (respects robots.txt crawl delay)
 MIN_PLAYERS_DEFAULT = 32   # matches swu-competitivehub.com filter standard
+RADIUS_DEFAULT_MILES = 100 # default --radius when --near is given
+EARTH_RADIUS_MILES = 3958.7613
 
 # DataTables column names used by /Match/GetRoundMatches (must match pairings-section.min.js)
 _MATCH_COLUMNS = ["TableNumber", "PodNumber", "Teams", "Decklists", "ResultString"]
@@ -155,14 +159,122 @@ def _t_date(t: dict) -> str:
     return str(t.get("startDate") or t.get("StartDate") or "")[:10]
 
 
+def _t_latlng(t: dict) -> Optional[Tuple[float, float]]:
+    """Return (lat, lng) for a tournament's venue, or None if not geolocated."""
+    lat = t.get("latitude", t.get("Latitude"))
+    lng = t.get("longitude", t.get("Longitude"))
+    if lat in (None, "", 0) and lng in (None, "", 0):
+        return None
+    try:
+        return float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None
+
+
+def _t_location(t: dict) -> str:
+    """Human-readable 'City, State, Country' for a tournament, best-effort."""
+    parts: List[str] = []
+    for keys in (("city", "City"),
+                 ("state", "State", "StateProvince", "stateProvince"),
+                 ("country", "Country")):
+        for k in keys:
+            v = t.get(k)
+            if v:
+                parts.append(str(v))
+                break
+    return ", ".join(parts)
+
+
+def _t_is_online(t: dict) -> bool:
+    """True if the event is online (no physical venue)."""
+    for k in ("isOnlineTournament", "IsOnlineTournament", "isOnline", "IsOnline",
+              "onlineTournament", "OnlineTournament"):
+        if k in t and t[k] is not None:
+            return bool(t[k])
+    # Fallback heuristic: no coordinates and no city/state means no venue.
+    return _t_latlng(t) is None and not _t_location(t)
+
+
+# ── Locality (geocoding + distance) ─────────────────────────────────────────────
+
+_COORD_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
+
+
+def parse_radius(text: str) -> float:
+    """
+    Parse a radius string into miles. Default unit is miles; 'km'/'mi' suffixes
+    override. Examples: '100' -> 100mi, '150km' -> 93.2mi, '75mi' -> 75mi.
+    """
+    s = text.strip().lower()
+    if s.endswith("km"):
+        return float(s[:-2].strip()) * 0.621371
+    if s.endswith("mi"):
+        return float(s[:-2].strip())
+    return float(s)
+
+
+def haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Great-circle distance in miles between two lat/lng points."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lng2 - lng1)
+    a = (math.sin(dphi / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dlam / 2) ** 2)
+    return 2 * EARTH_RADIUS_MILES * math.asin(math.sqrt(a))
+
+
+def geocode(place: str, verbose: bool) -> Tuple[float, float, str]:
+    """Resolve a place name to (lat, lng, display_name) via OpenStreetMap Nominatim."""
+    qs = urllib.parse.urlencode({"q": place, "format": "json", "limit": "1"})
+    url = f"{NOMINATIM_URL}?{qs}"
+    time.sleep(REQUEST_DELAY)
+    if verbose:
+        print(f"  GEOCODE {url}", file=sys.stderr)
+    req = urllib.request.Request(url, headers={
+        # Nominatim policy requires an identifying User-Agent.
+        "User-Agent": "swu-meta-breakdown/1.0 (melee.gg meta analysis script)",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8", errors="replace"))
+    if not data:
+        raise RuntimeError(
+            f"Could not geocode location: {place!r}. "
+            "Try a more specific name (e.g. 'Seattle, WA, USA') or pass raw "
+            "coordinates as --near \"lat,lng\"."
+        )
+    top = data[0]
+    return float(top["lat"]), float(top["lon"]), str(top.get("display_name", place))
+
+
+def resolve_location(near: str, verbose: bool) -> Tuple[float, float, str]:
+    """
+    Turn a --near value into (lat, lng, label).
+
+    Accepts raw 'lat,lng' coordinates (no network) or a place name (geocoded).
+    """
+    m = _COORD_RE.match(near)
+    if m:
+        lat, lng = float(m.group(1)), float(m.group(2))
+        return lat, lng, f"{lat:.4f}, {lng:.4f}"
+    return geocode(near, verbose)
+
+
 def fetch_tournaments(
-    start_date: str, end_date: str, min_players: int, verbose: bool
+    start_date: str, end_date: str, min_players: int, verbose: bool,
+    locality: Optional[Tuple[float, float, float, str]] = None,
 ) -> List[dict]:
     """
     Return all SWU Premier ended tournaments in the date range with >= min_players.
 
     Uses POST /Tournament/TournamentSearch — no API key required.
     Filters: Ended + Premier (server-side); date range and player count are client-side.
+
+    If `locality` is given as (lat, lng, radius_miles, label), only in-person events
+    whose venue falls within `radius_miles` of (lat, lng) are kept; online events and
+    events without coordinates are dropped. Each kept event gets a stashed
+    `_distance_mi` for reporting.
     """
     search_params_base = [
         ("ordering", "StartDate"), ("mode", "Table"),
@@ -182,6 +294,7 @@ def fetch_tournaments(
 
     results: List[dict] = []
     batch_size = 250
+    dumped_keys = False
 
     while start_offset <= total:
         resp = _post_json("/Tournament/TournamentSearch",
@@ -190,12 +303,30 @@ def fetch_tournaments(
         items = resp.get("data", [])  # type: ignore[union-attr]
         if not items:
             break
+        if verbose and not dumped_keys and items:
+            # Surface the raw field names so location keys can be confirmed live.
+            print(f"  [debug] tournament fields: {sorted(items[0].keys())}", file=sys.stderr)
+            dumped_keys = True
         for t in items:
             d = _t_date(t)
             if d < start_date or d > end_date:
                 continue
-            if _t_players(t) >= min_players:
-                results.append(t)
+            if _t_players(t) < min_players:
+                continue
+            if locality is not None:
+                lat0, lng0, radius_mi, _label = locality
+                if _t_is_online(t):
+                    continue
+                ll = _t_latlng(t)
+                if ll is None:
+                    if verbose:
+                        print(f"  [skip] {_t_name(t)}: no coordinates", file=sys.stderr)
+                    continue
+                dist = haversine_miles(lat0, lng0, ll[0], ll[1])
+                if dist > radius_mi:
+                    continue
+                t["_distance_mi"] = dist
+            results.append(t)
         start_offset += batch_size
 
     return results
@@ -476,15 +607,18 @@ def _build_data_sheet_xml(
     end_date: str,
     tournament_count: int,
     total_appearances: int,
+    locality_label: str = "",
 ) -> str:
     n_weeks = len(weeks)
     n_archs = len(archetypes_with_other)
     rows: List[str] = []
 
     # Row 1: title
+    locality_suffix = f" | {locality_label}" if locality_label else ""
     title = (
         f"SWU Meta Share Trend | {start_date} – {end_date} | "
         f"{tournament_count} events | {total_appearances} deck entries (round 1 only)"
+        f"{locality_suffix}"
     )
     rows.append(f'<row r="1" ht="20" customHeight="1">{_cell("A1", title, _S_TITLE)}</row>')
 
@@ -507,9 +641,12 @@ def _build_data_sheet_xml(
 
     # Footer note
     note_row = n_archs + 4
+    locality_note = (
+        f" Filtered to in-person events {locality_label}." if locality_label else ""
+    )
     rows.append(
         f'<row r="{note_row}">'
-        f'{_cell(f"A{note_row}", "Round 1 of Swiss only — each player counted once per tournament, eliminating survivorship bias. Top-cut excluded. Post-rotation (2026-03-13+) only.", _S_NOTE)}'
+        f'{_cell(f"A{note_row}", "Round 1 of Swiss only — each player counted once per tournament, eliminating survivorship bias. Top-cut excluded. Post-rotation (2026-03-13+) only." + locality_note, _S_NOTE)}'
         f'</row>'
     )
 
@@ -670,15 +807,17 @@ def write_xlsx(
     end_date: str,
     tournament_count: int,
     total_entries: int,
+    locality_label: str = "",
 ) -> None:
+    locality_suffix = f" — {locality_label}" if locality_label else ""
     chart_title = (
         f"SWU Meta Share Trend — {start_date} to {end_date} "
-        f"({tournament_count} events)"
+        f"({tournament_count} events){locality_suffix}"
     )
 
     data_sheet = _build_data_sheet_xml(
         archetypes_with_other, weeks, shares,
-        start_date, end_date, tournament_count, total_entries,
+        start_date, end_date, tournament_count, total_entries, locality_label,
     )
     chart_xml = _build_chart_xml(archetypes_with_other, weeks, shares, chart_title)
 
@@ -835,6 +974,14 @@ def parse_args() -> argparse.Namespace:
                    help="Top N archetypes shown individually; rest grouped into 'Other' (default: 10).")
     p.add_argument("--min-players", type=int, default=MIN_PLAYERS_DEFAULT,
                    help=f"Minimum event size (default: {MIN_PLAYERS_DEFAULT}).")
+    p.add_argument("--near", default=None, metavar='"lat,lng" | "place name"',
+                   help="Restrict to in-person events near this point. Accepts raw "
+                        "coordinates ('47.6,-122.3') or a place name ('Seattle, WA') "
+                        "geocoded via OpenStreetMap. Default: no locality filter.")
+    p.add_argument("--radius", default=str(RADIUS_DEFAULT_MILES), metavar="N[mi|km]",
+                   help=f"Radius around --near (default: {RADIUS_DEFAULT_MILES} miles). "
+                        "Unit defaults to miles; append 'km' or 'mi' to override "
+                        "(e.g. '150km'). Ignored unless --near is set.")
     p.add_argument("--output", default="meta_trend.xlsx")
     p.add_argument("--dry-run", action="store_true",
                    help="List qualifying tournaments; skip match data fetch.")
@@ -869,12 +1016,30 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    # ── Resolve locality (optional) ────────────────────────────────────────────
+    locality: Optional[Tuple[float, float, float, str]] = None
+    locality_label = ""
+    if args.near:
+        try:
+            radius_mi = parse_radius(args.radius)
+        except ValueError:
+            sys.exit(f"Error: could not parse --radius {args.radius!r} (try '100' or '150km').")
+        try:
+            lat, lng, place_label = resolve_location(args.near, args.verbose)
+        except RuntimeError as exc:
+            sys.exit(f"\n{exc}\n")
+        except urllib.error.URLError as exc:
+            sys.exit(f"\nGeocoding network error: {exc}\nPass raw --near \"lat,lng\" to skip geocoding.\n")
+        locality_label = f"within {radius_mi:.0f}mi of {place_label}"
+        locality = (lat, lng, radius_mi, locality_label)
+        print(f"Locality: {locality_label}  ({lat:.4f}, {lng:.4f})")
+
     # ── Fetch tournaments ──────────────────────────────────────────────────────
     print(f"Fetching SWU tournaments: {start_date} → {end_date}  (min {args.min_players} players)...")
 
     try:
         tournaments = fetch_tournaments(
-            str(start_date), str(end_date), args.min_players, args.verbose
+            str(start_date), str(end_date), args.min_players, args.verbose, locality
         )
     except RuntimeError as exc:
         sys.exit(f"\n{exc}\n")
@@ -888,17 +1053,27 @@ def main() -> None:
         )
 
     if not tournaments:
+        locality_hint = (
+            "  • No in-person events within the radius — try a larger --radius\n"
+            if locality else ""
+        )
         sys.exit(
             f"No SWU Premier tournaments found ({start_date} to {end_date}, "
-            f"min {args.min_players} players).\n"
+            f"min {args.min_players} players"
+            f"{', ' + locality_label if locality_label else ''}).\n"
             "Possible causes:\n"
+            f"{locality_hint}"
             "  • No events in the date range — try widening --timeframe\n"
             "  • Game/format filtering may be too strict (try --verbose)\n"
         )
 
     print(f"Found {len(tournaments)} qualifying tournament(s):\n")
     for t in sorted(tournaments, key=_t_date):
-        print(f"  • {_t_name(t):<55}  {_t_players(t):>4} players  {_t_date(t)}")
+        loc = ""
+        if locality is not None:
+            place = _t_location(t)
+            loc = f"  [{t.get('_distance_mi', 0):.0f}mi{' · ' + place if place else ''}]"
+        print(f"  • {_t_name(t):<55}  {_t_players(t):>4} players  {_t_date(t)}{loc}")
 
     if args.dry_run:
         print("\nDry run complete. Re-run without --dry-run to process match data.")
@@ -974,7 +1149,7 @@ def main() -> None:
     write_xlsx(
         archetypes_with_other, weeks, shares,
         args.output, str(start_date), str(end_date),
-        len(tournaments), total_entries,
+        len(tournaments), total_entries, locality_label,
     )
 
     print(

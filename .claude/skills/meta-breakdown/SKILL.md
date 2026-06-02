@@ -1,5 +1,5 @@
 ---
-description: Builds a stacked area trend chart showing how each deck's meta share percentage has evolved over time, using real melee.gg tournament results for Star Wars Unlimited. Use when the user wants meta trends, meta share over time, deck popularity trends, or how the meta has evolved. Accepts optional --timeframe YYYY-MM-DD:YYYY-MM-DD and --num-decks N arguments.
+description: Builds a stacked area trend chart showing how each deck's meta share percentage has evolved over time, using real melee.gg tournament results for Star Wars Unlimited. Use when the user wants meta trends, meta share over time, deck popularity trends, how the meta has evolved, or the local/regional meta near a location. Accepts optional --timeframe YYYY-MM-DD:YYYY-MM-DD, --num-decks N, and --near/--radius (locality) arguments.
 ---
 
 Today's date: !`date +%Y-%m-%d`
@@ -12,13 +12,19 @@ Build a SWU meta share trend chart using: $ARGUMENTS
    - `--timeframe`: default is the last 30 days (computed by the script at runtime). Warn if start date is before `2026-03-13` (pre-rotation data uses different card legality).
    - `--num-decks`: default `10` (top N archetypes shown individually; all remaining decks are grouped into "Other").
    - `--min-players`: default `32`.
+   - `--near`: **default none** (national/global meta). When the user asks for the *local* or *regional* meta, set this to either raw `"lat,lng"` coordinates or a place name like `"Seattle, WA"` (geocoded via OpenStreetMap Nominatim). Restricts to in-person events only; online events and events without coordinates are dropped.
+   - `--radius`: default `100` (miles). Append `km` or `mi` to override the unit (e.g. `150km`). Only applies when `--near` is set.
    - `--output`: default `meta_trend.xlsx`.
 
 2. **Run the script** (stdlib only, no install needed):
    ```
    python ${CLAUDE_SKILL_DIR}/meta_breakdown.py --timeframe <timeframe> --num-decks <n> [other args]
    ```
-   Pass `--verbose` on the first run of a session so API issues surface clearly.
+   For a local meta, add `--near` (and optionally `--radius`):
+   ```
+   python ${CLAUDE_SKILL_DIR}/meta_breakdown.py --near "Seattle, WA" --radius 150
+   ```
+   Pass `--verbose` on the first run of a session so API issues surface clearly. With `--verbose`, the script also dumps the raw melee.gg tournament field names — useful for confirming the live latitude/longitude/city keys if locality filtering returns nothing.
 
 3. **Handle failures.**
    - *403 / network error*: The environment may block outbound requests. Tell the user to run the script locally.
