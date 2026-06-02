@@ -29,7 +29,7 @@ Build a SWU meta share trend chart using: $ARGUMENTS
      3. swumetastats.com/api-docs public API (pre-aggregated, not raw — note this clearly)
 
 4. **Summarise results** after a successful run:
-   - Events and total deck appearances processed
+   - Events and total deck entries processed (round 1 only, one entry per player per event)
    - Top 3 archetypes by overall meta share across the full period
    - Notable trends: archetypes that grew or shrank by ≥5 percentage points from first to last week
    - Size of the "Other" bucket — if it exceeds 20%, suggest increasing `--num-decks`
@@ -44,4 +44,4 @@ Build a SWU meta share trend chart using: $ARGUMENTS
 - Decks outside the top N are grouped into "Other" so the stacked areas always sum to 100%.
 - Data is bucketed by calendar week (Monday-start). Each tournament is assigned to the week of its start date.
 - Swiss rounds only — top-cut is excluded to avoid selection bias.
-- Appearances are counted per match-competitor per round (not per unique player), so high-round-count events naturally have more weight.
+- Only round 1 is used for counting: every active player is paired in round 1 before any drops, so each player's deck is counted exactly once per tournament. This avoids the survivorship bias of counting later rounds (where only players with winning records remain).

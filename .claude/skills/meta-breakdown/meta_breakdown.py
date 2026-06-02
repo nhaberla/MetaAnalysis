@@ -296,11 +296,12 @@ def process_tournament_meta(
     verbose: bool,
 ) -> int:
     """
-    Count archetype appearances per week bucket.
+    Count archetype entries per week bucket using only round 1.
 
-    Each competitor in each Swiss match counts as 1 appearance for their archetype.
-    The tournament's start date determines which week bucket it falls in.
-    Returns total appearances added.
+    Round 1 pairs every active player before any drops, so each player's deck
+    is counted exactly once per tournament. Using later rounds would double-count
+    survivors and introduce survivorship bias toward stronger archetypes.
+    Returns the number of deck entries added.
     """
     tid = _t_id(tournament)
     if not tid:
@@ -321,23 +322,23 @@ def process_tournament_meta(
     week = week_start(_t_date(tournament))
     added = 0
 
-    for round_id in swiss_round_ids:
-        try:
-            matches = fetch_round_matches(round_id, verbose)
-        except Exception as exc:
-            if verbose:
-                print(f"  [warn] round {round_id}: {exc}", file=sys.stderr)
-            continue
+    # Only round 1 — captures the full active field, one entry per player.
+    try:
+        matches = fetch_round_matches(swiss_round_ids[0], verbose)
+    except Exception as exc:
+        if verbose:
+            print(f"  [warn] round 1 ({swiss_round_ids[0]}): {exc}", file=sys.stderr)
+        return 0
 
-        for m in matches:
-            comps = m.get("Competitors", [])
-            for c in comps:
-                dl = (c.get("Decklists") or [{}])[0]
-                pair = parse_decklist_name(dl.get("DecklistName", ""))
-                if pair:
-                    arch = archetype_label(*pair)
-                    week_arch_counts[week][arch] += 1
-                    added += 1
+    for m in matches:
+        comps = m.get("Competitors", [])
+        for c in comps:
+            dl = (c.get("Decklists") or [{}])[0]
+            pair = parse_decklist_name(dl.get("DecklistName", ""))
+            if pair:
+                arch = archetype_label(*pair)
+                week_arch_counts[week][arch] += 1
+                added += 1
 
     return added
 
@@ -483,7 +484,7 @@ def _build_data_sheet_xml(
     # Row 1: title
     title = (
         f"SWU Meta Share Trend | {start_date} – {end_date} | "
-        f"{tournament_count} events | {total_appearances} deck-round appearances"
+        f"{tournament_count} events | {total_appearances} deck entries (round 1 only)"
     )
     rows.append(f'<row r="1" ht="20" customHeight="1">{_cell("A1", title, _S_TITLE)}</row>')
 
@@ -508,7 +509,7 @@ def _build_data_sheet_xml(
     note_row = n_archs + 4
     rows.append(
         f'<row r="{note_row}">'
-        f'{_cell(f"A{note_row}", "Swiss rounds only. Top-cut excluded. Post-rotation (2026-03-13+) only. Each match-competitor counted as 1 appearance per round.", _S_NOTE)}'
+        f'{_cell(f"A{note_row}", "Round 1 of Swiss only — each player counted once per tournament, eliminating survivorship bias. Top-cut excluded. Post-rotation (2026-03-13+) only.", _S_NOTE)}'
         f'</row>'
     )
 
@@ -668,7 +669,7 @@ def write_xlsx(
     start_date: str,
     end_date: str,
     tournament_count: int,
-    total_appearances: int,
+    total_entries: int,
 ) -> None:
     chart_title = (
         f"SWU Meta Share Trend — {start_date} to {end_date} "
@@ -677,7 +678,7 @@ def write_xlsx(
 
     data_sheet = _build_data_sheet_xml(
         archetypes_with_other, weeks, shares,
-        start_date, end_date, tournament_count, total_appearances,
+        start_date, end_date, tournament_count, total_entries,
     )
     chart_xml = _build_chart_xml(archetypes_with_other, weeks, shares, chart_title)
 
@@ -906,21 +907,21 @@ def main() -> None:
     # ── Process match data ─────────────────────────────────────────────────────
     week_arch_counts: "defaultdict[str, defaultdict[str, int]]" = \
         defaultdict(lambda: defaultdict(int))
-    total_appearances = 0
+    total_entries = 0
 
-    print(f"\nProcessing match results ({len(tournaments)} events)...\n")
+    print(f"\nProcessing round 1 results ({len(tournaments)} events)...\n")
     for t in tournaments:
         name = _t_name(t)
         try:
             added = process_tournament_meta(t, week_arch_counts, args.verbose)
-            total_appearances += added
-            print(f"  ✓  {name:<55}  {added} appearances")
+            total_entries += added
+            print(f"  ✓  {name:<55}  {added} entries")
         except Exception as exc:  # noqa: BLE001
             print(f"  ✗  {name:<55}  ERROR: {exc}", file=sys.stderr)
 
-    if total_appearances == 0:
+    if total_entries == 0:
         sys.exit(
-            "\nNo deck appearance data collected.\n"
+            "\nNo deck entry data collected.\n"
             "Possible causes:\n"
             "  • All qualifying tournaments had decklists disabled\n"
             "  • melee.gg page structure may have changed (try --verbose)\n"
@@ -929,7 +930,7 @@ def main() -> None:
             "  • Use swumetastats.com/api-docs for aggregated meta data\n"
         )
 
-    print(f"\nTotal deck appearances recorded: {total_appearances}")
+    print(f"\nTotal deck entries recorded: {total_entries}")
 
     # ── Compute meta shares ────────────────────────────────────────────────────
     top_archs = compute_top_archetypes(week_arch_counts, args.num_decks)
@@ -944,14 +945,14 @@ def main() -> None:
             grand_totals[arch] += count
     grand_total = sum(grand_totals.values())
 
-    print(f"\nTop {len(top_archs)} archetypes by total appearances:\n")
+    print(f"\nTop {len(top_archs)} archetypes by total entries:\n")
     for i, arch in enumerate(top_archs, 1):
         pct = grand_totals[arch] / grand_total * 100 if grand_total else 0.0
-        print(f"  {i:2}.  {arch:<45}  {pct:.1f}%  ({grand_totals[arch]} appearances)")
+        print(f"  {i:2}.  {arch:<45}  {pct:.1f}%  ({grand_totals[arch]} entries)")
 
     other_total = grand_total - sum(grand_totals[a] for a in top_archs)
     other_pct = other_total / grand_total * 100 if grand_total else 0.0
-    print(f"\n  Other (all remaining decks):  {other_pct:.1f}%  ({other_total} appearances)")
+    print(f"\n  Other (all remaining decks):  {other_pct:.1f}%  ({other_total} entries)")
     if other_pct > 20:
         print(f"  ⚠  'Other' is large ({other_pct:.1f}%). Consider --num-decks {args.num_decks + 5}.")
 
@@ -973,7 +974,7 @@ def main() -> None:
     write_xlsx(
         archetypes_with_other, weeks, shares,
         args.output, str(start_date), str(end_date),
-        len(tournaments), total_appearances,
+        len(tournaments), total_entries,
     )
 
     print(
