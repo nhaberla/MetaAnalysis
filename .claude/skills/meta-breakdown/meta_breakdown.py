@@ -707,8 +707,10 @@ def _build_chart_xml(
             f'<c:pt idx="{j}"><c:v>{_xe(_format_week_label(w))}</c:v></c:pt>'
             for j, w in enumerate(weeks)
         )
+        # Values stored 0-100 in the chart cache (not linked to cells) so the
+        # axis scale is always integers (0-100) regardless of app numFmt support.
         val_pts = "".join(
-            f'<c:pt idx="{j}"><c:v>{shares.get(arch, {}).get(w, 0.0):.6f}</c:v></c:pt>'
+            f'<c:pt idx="{j}"><c:v>{shares.get(arch, {}).get(w, 0.0) * 100:.4f}</c:v></c:pt>'
             for j, w in enumerate(weeks)
         )
 
@@ -734,13 +736,10 @@ def _build_chart_xml(
             f'</c:strRef>'
             f'</c:cat>'
             f'<c:val>'
-            f'<c:numRef>'
-            f'<c:f>{val_f}</c:f>'
-            f'<c:numCache>'
-            f'<c:formatCode>0.0%</c:formatCode>'
+            f'<c:numLit>'
+            f'<c:formatCode>0.0</c:formatCode>'
             f'<c:ptCount val="{n_weeks}"/>{val_pts}'
-            f'</c:numCache>'
-            f'</c:numRef>'
+            f'</c:numLit>'
             f'</c:val>'
             f'</c:ser>'
         )
@@ -779,7 +778,7 @@ def _build_chart_xml(
         '<c:scaling><c:orientation val="minMax"/></c:scaling>'
         '<c:delete val="0"/>'
         '<c:axPos val="b"/>'
-        '<c:tickMark val="out"/>'
+        '<c:majorTickMark val="out"/>'
         '<c:tickLblPos val="nextTo"/>'
         f'<c:crossAx val="{ax_val}"/>'
         '</c:catAx>'
@@ -787,14 +786,15 @@ def _build_chart_xml(
         f'<c:axId val="{ax_val}"/>'
         '<c:scaling>'
         '<c:orientation val="minMax"/>'
-        '<c:max val="1"/>'
+        '<c:min val="0"/>'
+        '<c:max val="100"/>'
         '</c:scaling>'
         '<c:delete val="0"/>'
         '<c:axPos val="l"/>'
-        '<c:majorUnit val="0.25"/>'
-        '<c:numFmt formatCode="0%" sourceLinked="0"/>'
+        '<c:majorUnit val="25"/>'
+        '<c:numFmt formatCode="0&quot;%&quot;" sourceLinked="0"/>'
         '<c:majorGridlines/>'
-        '<c:tickMark val="out"/>'
+        '<c:majorTickMark val="out"/>'
         '<c:tickLblPos val="nextTo"/>'
         f'<c:crossAx val="{ax_cat}"/>'
         '</c:valAx>'
