@@ -507,9 +507,9 @@ def compute_meta_shares(
             continue
 
         for arch in top_archs:
-            shares[arch][week] = week_data.get(arch, 0) / total * 100.0
+            shares[arch][week] = week_data.get(arch, 0) / total
         other_count = total - sum(week_data.get(arch, 0) for arch in top_archs)
-        shares["Other"][week] = max(0.0, other_count / total * 100.0)
+        shares["Other"][week] = max(0.0, other_count / total)
 
     return shares
 
@@ -539,7 +539,7 @@ _STYLES_XML = """\
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <numFmts count="1">
-    <numFmt numFmtId="164" formatCode="0.0&quot;%&quot;"/>
+    <numFmt numFmtId="164" formatCode="0.0%"/>
   </numFmts>
   <fonts count="6">
     <font><sz val="9"/><name val="Calibri"/></font>
@@ -638,9 +638,9 @@ def _build_data_sheet_xml(
         num_style = _S_OTHER_NUM if is_other else _S_NUMBER
         cells = [_cell(f"A{ri}", arch, lbl_style)]
         for ci, week in enumerate(weeks, start=2):
-            val = round(shares.get(arch, {}).get(week, 0.0), 2)
+            val = round(shares.get(arch, {}).get(week, 0.0), 4)
             cells.append(_cell(f"{_col_letter(ci)}{ri}", val, num_style))
-        overall_val = round(overall_shares.get(arch, 0.0), 2)
+        overall_val = round(overall_shares.get(arch, 0.0), 4)
         cells.append(_cell(f"{_col_letter(overall_col)}{ri}", overall_val, num_style))
         rows.append(f'<row r="{ri}">{"".join(cells)}</row>')
 
@@ -708,7 +708,7 @@ def _build_chart_xml(
             for j, w in enumerate(weeks)
         )
         val_pts = "".join(
-            f'<c:pt idx="{j}"><c:v>{shares.get(arch, {}).get(w, 0.0):.4f}</c:v></c:pt>'
+            f'<c:pt idx="{j}"><c:v>{shares.get(arch, {}).get(w, 0.0):.6f}</c:v></c:pt>'
             for j, w in enumerate(weeks)
         )
 
@@ -737,7 +737,7 @@ def _build_chart_xml(
             f'<c:numRef>'
             f'<c:f>{val_f}</c:f>'
             f'<c:numCache>'
-            f'<c:formatCode>0.0</c:formatCode>'
+            f'<c:formatCode>0.0%</c:formatCode>'
             f'<c:ptCount val="{n_weeks}"/>{val_pts}'
             f'</c:numCache>'
             f'</c:numRef>'
@@ -787,11 +787,11 @@ def _build_chart_xml(
         f'<c:axId val="{ax_val}"/>'
         '<c:scaling>'
         '<c:orientation val="minMax"/>'
-        '<c:max val="100"/>'
+        '<c:max val="1"/>'
         '</c:scaling>'
         '<c:delete val="0"/>'
         '<c:axPos val="l"/>'
-        '<c:numFmt formatCode="0.0&quot;%&quot;" sourceLinked="0"/>'
+        '<c:numFmt formatCode="0%" sourceLinked="0"/>'
         '<c:tickMark val="out"/>'
         '<c:tickLblPos val="nextTo"/>'
         f'<c:crossAx val="{ax_cat}"/>'
@@ -1135,10 +1135,10 @@ def main() -> None:
     other_total = grand_total - sum(grand_totals[a] for a in top_archs)
     other_pct = other_total / grand_total * 100 if grand_total else 0.0
     overall_shares: Dict[str, float] = {
-        arch: grand_totals.get(arch, 0) / grand_total * 100 if grand_total else 0.0
+        arch: grand_totals.get(arch, 0) / grand_total if grand_total else 0.0
         for arch in top_archs
     }
-    overall_shares["Other"] = other_pct
+    overall_shares["Other"] = other_total / grand_total if grand_total else 0.0
     print(f"\n  Other (all remaining decks):  {other_pct:.1f}%  ({other_total} entries)")
     if other_pct > 20:
         print(f"  ⚠  'Other' is large ({other_pct:.1f}%). Consider --num-decks {args.num_decks + 5}.")
@@ -1148,8 +1148,8 @@ def main() -> None:
         print(f"\n── Meta share trend ({weeks[0]} → {weeks[-1]}) ──\n")
         first_week, last_week = weeks[0], weeks[-1]
         for arch in top_archs:
-            first_pct = shares[arch].get(first_week, 0.0)
-            last_pct = shares[arch].get(last_week, 0.0)
+            first_pct = shares[arch].get(first_week, 0.0) * 100
+            last_pct = shares[arch].get(last_week, 0.0) * 100
             delta = last_pct - first_pct
             arrow = f"↑ +{delta:.1f}%" if delta >= 0 else f"↓ {delta:.1f}%"
             flag = "  ⚡" if abs(delta) >= 5 else ""
