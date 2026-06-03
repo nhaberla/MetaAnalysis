@@ -334,6 +334,13 @@ def fetch_tournaments(
 
     Uses POST /Tournament/TournamentSearch — no API key required.
     Filters: Ended + Premier (server-side); date range and player count are client-side.
+
+    melee.gg returns events only *approximately* sorted by start date — the index
+    is globally ascending but locally shuffled by several weeks. So we page
+    backward from the newest events and keep going until an entire batch predates
+    `start_date` by more than JITTER_BUFFER_DAYS, guaranteeing every in-range event
+    is seen regardless of where the shuffle placed it. (A fixed tail slice would
+    silently drop in-range events shuffled to lower indices.)
     """
     search_params_base = [
         ("ordering", "StartDate"), ("mode", "Table"),
@@ -346,34 +353,53 @@ def fetch_tournaments(
     if verbose:
         print(f"  Total Ended+Premier SWU events indexed: {total}", file=sys.stderr)
 
-    days = max(1, (datetime.strptime(end_date, "%Y-%m-%d") -
-                   datetime.strptime(start_date, "%Y-%m-%d")).days)
-    fetch_window = max(500, days * 50)
-    start_offset = max(0, total - fetch_window)
+    # Stop paging once even the newest event in a batch is older than this cutoff.
+    # The buffer absorbs melee's multi-week index shuffle so stragglers aren't missed.
+    JITTER_BUFFER_DAYS = 35
+    cutoff = (datetime.strptime(start_date, "%Y-%m-%d") -
+              timedelta(days=JITTER_BUFFER_DAYS)).strftime("%Y-%m-%d")
 
     results: List[dict] = []
+    seen_ids: set = set()
     batch_size = 250
     dumped_keys = False
 
-    while start_offset <= total:
+    offset = max(0, total - batch_size)
+    while offset >= 0:
         resp = _post_json("/Tournament/TournamentSearch",
-                          search_params_base + _search_dt_params(start_offset, batch_size),
+                          search_params_base + _search_dt_params(offset, batch_size),
                           verbose=verbose)
         items = resp.get("data", [])  # type: ignore[union-attr]
-        if not items:
-            break
-        if verbose and not dumped_keys and items:
+        if items and verbose and not dumped_keys:
             # Surface the raw field names so location keys can be confirmed live.
             print(f"  [debug] tournament fields: {sorted(items[0].keys())}", file=sys.stderr)
             dumped_keys = True
+
+        batch_max_date = ""
         for t in items:
             d = _t_date(t)
+            if d > batch_max_date:
+                batch_max_date = d
             if d < start_date or d > end_date:
                 continue
             if _t_players(t) < min_players:
                 continue
+            tid = _t_id(t)
+            if tid in seen_ids:
+                continue
+            seen_ids.add(tid)
             results.append(t)
-        start_offset += batch_size
+
+        # Once the newest event in this (deeper) batch predates our buffered window,
+        # everything below is older still — safe to stop.
+        if batch_max_date and batch_max_date < cutoff:
+            break
+        if offset == 0:
+            break
+        offset = max(0, offset - batch_size)
+
+    if verbose:
+        print(f"  Paged back to ~{cutoff} cutoff; {len(results)} events in range", file=sys.stderr)
 
     return results
 
