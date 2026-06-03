@@ -707,10 +707,8 @@ def _build_chart_xml(
             f'<c:pt idx="{j}"><c:v>{_xe(_format_week_label(w))}</c:v></c:pt>'
             for j, w in enumerate(weeks)
         )
-        # Values stored 0-100 in the chart cache (not linked to cells) so the
-        # axis scale is always integers (0-100) regardless of app numFmt support.
         val_pts = "".join(
-            f'<c:pt idx="{j}"><c:v>{shares.get(arch, {}).get(w, 0.0) * 100:.4f}</c:v></c:pt>'
+            f'<c:pt idx="{j}"><c:v>{shares.get(arch, {}).get(w, 0.0):.6f}</c:v></c:pt>'
             for j, w in enumerate(weeks)
         )
 
@@ -736,10 +734,13 @@ def _build_chart_xml(
             f'</c:strRef>'
             f'</c:cat>'
             f'<c:val>'
-            f'<c:numLit>'
-            f'<c:formatCode>0.0</c:formatCode>'
+            f'<c:numRef>'
+            f'<c:f>{val_f}</c:f>'
+            f'<c:numCache>'
+            f'<c:formatCode>0.0%</c:formatCode>'
             f'<c:ptCount val="{n_weeks}"/>{val_pts}'
-            f'</c:numLit>'
+            f'</c:numCache>'
+            f'</c:numRef>'
             f'</c:val>'
             f'</c:ser>'
         )
@@ -767,7 +768,7 @@ def _build_chart_xml(
         '<c:plotArea>'
         '<c:layout/>'
         '<c:areaChart>'
-        '<c:grouping val="stacked"/>'
+        '<c:grouping val="percentStacked"/>'
         '<c:varyColors val="0"/>'
         + "".join(series_parts) +
         f'<c:axId val="{ax_cat}"/>'
@@ -789,9 +790,7 @@ def _build_chart_xml(
         '</c:scaling>'
         '<c:delete val="0"/>'
         '<c:axPos val="l"/>'
-        '<c:numFmt formatCode="0&quot;%&quot;" sourceLinked="0"/>'
         '<c:majorGridlines/>'
-        '<c:majorTickMark val="out"/>'
         '<c:tickLblPos val="nextTo"/>'
         f'<c:crossAx val="{ax_cat}"/>'
         '</c:valAx>'
