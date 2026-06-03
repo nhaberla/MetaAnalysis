@@ -790,6 +790,7 @@ def _build_chart_xml(
         '</c:scaling>'
         '<c:delete val="0"/>'
         '<c:axPos val="l"/>'
+        '<c:numFmt formatCode="0%" sourceLinked="0"/>'
         '<c:majorGridlines/>'
         '<c:tickLblPos val="nextTo"/>'
         f'<c:crossAx val="{ax_cat}"/>'
