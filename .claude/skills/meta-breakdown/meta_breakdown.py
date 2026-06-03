@@ -159,18 +159,6 @@ def _t_date(t: dict) -> str:
     return str(t.get("startDate") or t.get("StartDate") or "")[:10]
 
 
-def _t_latlng(t: dict) -> Optional[Tuple[float, float]]:
-    """Return (lat, lng) for a tournament's venue, or None if not geolocated."""
-    lat = t.get("latitude", t.get("Latitude"))
-    lng = t.get("longitude", t.get("Longitude"))
-    if lat in (None, "", 0) and lng in (None, "", 0):
-        return None
-    try:
-        return float(lat), float(lng)
-    except (TypeError, ValueError):
-        return None
-
-
 def _t_location(t: dict) -> str:
     """Human-readable 'City, State, Country' for a tournament, best-effort."""
     parts: List[str] = []
@@ -185,14 +173,81 @@ def _t_location(t: dict) -> str:
     return ", ".join(parts)
 
 
-def _t_is_online(t: dict) -> bool:
-    """True if the event is online (no physical venue)."""
-    for k in ("isOnlineTournament", "IsOnlineTournament", "isOnline", "IsOnline",
-              "onlineTournament", "OnlineTournament"):
-        if k in t and t[k] is not None:
-            return bool(t[k])
-    # Fallback heuristic: no coordinates and no city/state means no venue.
-    return _t_latlng(t) is None and not _t_location(t)
+# ── Venue geocoding ────────────────────────────────────────────────────────────
+
+# Cache resolved (lat, lng) by venue ID to avoid redundant Nominatim hits.
+_VENUE_COORD_CACHE: Dict[int, Optional[Tuple[float, float]]] = {}
+
+_VENUE_ID_RE = re.compile(
+    r'data-type=["\']venue["\'][^>]*data-id=["\'](\d+)["\']'
+    r'|data-id=["\'](\d+)["\'][^>]*data-type=["\']venue["\']'
+)
+
+
+def _parse_venue_id(html: str) -> Optional[int]:
+    """Extract the venue ID from a /Tournament/View HTML page."""
+    m = _VENUE_ID_RE.search(html)
+    if m:
+        raw = m.group(1) or m.group(2)
+        return int(raw)
+    return None
+
+
+def _fetch_venue_coords(venue_id: int, verbose: bool) -> Optional[Tuple[float, float]]:
+    """
+    Resolve a venue to (lat, lng) via /Venue/GetDetails + Nominatim geocoding.
+    Results are cached by venue ID. Returns None if the venue has no usable address.
+    """
+    if venue_id in _VENUE_COORD_CACHE:
+        return _VENUE_COORD_CACHE[venue_id]
+
+    try:
+        raw = _get_html(f"/Venue/GetDetails?id={venue_id}", verbose=verbose)
+        d = json.loads(raw)
+    except Exception:
+        _VENUE_COORD_CACHE[venue_id] = None
+        return None
+
+    street = str(d.get("AddressStreetAddress") or "").strip()
+    city = str(d.get("AddressCity") or "").strip()
+    state = str(d.get("AddressState") or "").strip()
+    country = str(d.get("AddressCountry") or "").strip()
+
+    if not city:
+        _VENUE_COORD_CACHE[venue_id] = None
+        return None
+
+    # Try full address first; fall back to city-level if Nominatim rejects it.
+    candidates = []
+    if street:
+        candidates.append(", ".join(p for p in [street, city, state, country] if p))
+    candidates.append(", ".join(p for p in [city, state, country] if p))
+
+    coords: Optional[Tuple[float, float]] = None
+    for query in candidates:
+        try:
+            lat, lng, _ = geocode(query, verbose)
+            coords = (lat, lng)
+            break
+        except Exception:
+            continue
+
+    _VENUE_COORD_CACHE[venue_id] = coords
+    return coords
+
+
+def _resolve_tournament_coords(
+    tournament_id: int, html: str, verbose: bool
+) -> Optional[Tuple[float, float]]:
+    """
+    Return (lat, lng) for a tournament's physical venue, or None for online events.
+    Parses the venue ID from the already-fetched View HTML and geocodes via the
+    /Venue/GetDetails endpoint + Nominatim.
+    """
+    venue_id = _parse_venue_id(html)
+    if venue_id is None:
+        return None
+    return _fetch_venue_coords(venue_id, verbose)
 
 
 # ── Locality (geocoding + distance) ─────────────────────────────────────────────
@@ -263,18 +318,12 @@ def resolve_location(near: str, verbose: bool) -> Tuple[float, float, str]:
 
 def fetch_tournaments(
     start_date: str, end_date: str, min_players: int, verbose: bool,
-    locality: Optional[Tuple[float, float, float, str]] = None,
 ) -> List[dict]:
     """
     Return all SWU Premier ended tournaments in the date range with >= min_players.
 
     Uses POST /Tournament/TournamentSearch — no API key required.
     Filters: Ended + Premier (server-side); date range and player count are client-side.
-
-    If `locality` is given as (lat, lng, radius_miles, label), only in-person events
-    whose venue falls within `radius_miles` of (lat, lng) are kept; online events and
-    events without coordinates are dropped. Each kept event gets a stashed
-    `_distance_mi` for reporting.
     """
     search_params_base = [
         ("ordering", "StartDate"), ("mode", "Table"),
@@ -313,23 +362,49 @@ def fetch_tournaments(
                 continue
             if _t_players(t) < min_players:
                 continue
-            if locality is not None:
-                lat0, lng0, radius_mi, _label = locality
-                if _t_is_online(t):
-                    continue
-                ll = _t_latlng(t)
-                if ll is None:
-                    if verbose:
-                        print(f"  [skip] {_t_name(t)}: no coordinates", file=sys.stderr)
-                    continue
-                dist = haversine_miles(lat0, lng0, ll[0], ll[1])
-                if dist > radius_mi:
-                    continue
-                t["_distance_mi"] = dist
             results.append(t)
         start_offset += batch_size
 
     return results
+
+
+def filter_tournaments_by_locality(
+    tournaments: List[dict],
+    locality: Tuple[float, float, float, str],
+    verbose: bool,
+) -> List[dict]:
+    """
+    Filter tournaments to those whose physical venue is within the locality radius.
+
+    melee.gg's search API carries no location data, so we resolve each tournament's
+    venue by parsing its /Tournament/View page (already in the HTTP cache from the
+    round-ID lookup) and geocoding the structured address via /Venue/GetDetails +
+    Nominatim. Results are cached by venue ID.
+
+    Each kept tournament gets a `_distance_mi` key for reporting.
+    Online-only events (no venue anchor on the View page) are dropped.
+    """
+    lat0, lng0, radius_mi, _label = locality
+    kept: List[dict] = []
+    for t in tournaments:
+        tid = _t_id(t)
+        if not tid:
+            continue
+        try:
+            html = _get_html(f"/Tournament/View/{tid}", verbose=verbose)
+        except Exception:
+            continue
+        ll = _resolve_tournament_coords(tid, html, verbose)
+        if ll is None:
+            if verbose:
+                print(f"  [locality-skip] {_t_name(t)}: no venue / no geocode", file=sys.stderr)
+            continue
+        dist = haversine_miles(lat0, lng0, ll[0], ll[1])
+        if dist > radius_mi:
+            continue
+        t["_distance_mi"] = dist
+        kept.append(t)
+    return kept
 
 
 # ── Archetype discovery ───────────────────────────────────────────────────────
@@ -364,10 +439,13 @@ def _is_swiss_round_name(name: str) -> bool:
     return bool(re.match(r"^Round\s+\d+$", name.strip(), re.IGNORECASE))
 
 
-def fetch_swiss_round_ids(tournament_id: int, verbose: bool) -> Tuple[List[str], bool]:
+def fetch_swiss_round_ids(
+    tournament_id: int, verbose: bool
+) -> Tuple[List[str], bool, str]:
     """
     Parse /Tournament/View/{id} HTML to extract Swiss round IDs and decklist visibility.
-    Returns (swiss_round_ids, decklist_enabled).
+    Returns (swiss_round_ids, decklist_enabled, html).
+    The HTML is returned so callers can extract venue info without a second GET.
     """
     html = _get_html(f"/Tournament/View/{tournament_id}", verbose=verbose)
 
@@ -393,7 +471,7 @@ def fetch_swiss_round_ids(tournament_id: int, verbose: bool) -> Tuple[List[str],
         all_names = [name for _, name in round_buttons]
         print(f"  [debug] rounds: {all_names} | decklists: {decklist_enabled}", file=sys.stderr)
 
-    return swiss_ids, decklist_enabled
+    return swiss_ids, decklist_enabled, html
 
 
 def fetch_round_matches(round_id: str, verbose: bool) -> List[dict]:
@@ -438,7 +516,7 @@ def process_tournament_meta(
     if not tid:
         return 0
 
-    swiss_round_ids, decklist_enabled = fetch_swiss_round_ids(tid, verbose)
+    swiss_round_ids, decklist_enabled, _html = fetch_swiss_round_ids(tid, verbose)
 
     if not decklist_enabled:
         if verbose:
@@ -787,18 +865,25 @@ def _build_chart_xml(
         f'<c:axId val="{ax_val}"/>'
         '<c:scaling>'
         '<c:orientation val="minMax"/>'
-        '<c:max val="1"/>'
+        '<c:max val="100"/>'
         '<c:min val="0"/>'
         '</c:scaling>'
         '<c:delete val="0"/>'
         '<c:axPos val="l"/>'
         '<c:majorGridlines/>'
-        '<c:numFmt formatCode="0%" sourceLinked="0"/>'
+        '<c:numFmt formatCode="0&quot;%&quot;" sourceLinked="0"/>'
+        '<c:title>'
+        '<c:tx><c:rich>'
+        '<a:bodyPr rot="-5400000"/><a:lstStyle/>'
+        '<a:p><a:r><a:t>Meta Share (%)</a:t></a:r></a:p>'
+        '</c:rich></c:tx>'
+        '<c:overlay val="0"/>'
+        '</c:title>'
         '<c:tickLblPos val="nextTo"/>'
         f'<c:crossAx val="{ax_cat}"/>'
         '<c:crosses val="autoZero"/>'
         '<c:crossBetween val="midCat"/>'
-        '<c:majorUnit val="0.25"/>'
+        '<c:majorUnit val="25"/>'
         '</c:valAx>'
         '</c:plotArea>'
         '<c:legend><c:legendPos val="r"/><c:overlay val="0"/></c:legend>'
@@ -1050,7 +1135,7 @@ def main() -> None:
 
     try:
         tournaments = fetch_tournaments(
-            str(start_date), str(end_date), args.min_players, args.verbose, locality
+            str(start_date), str(end_date), args.min_players, args.verbose
         )
     except RuntimeError as exc:
         sys.exit(f"\n{exc}\n")
@@ -1062,6 +1147,10 @@ def main() -> None:
             "  • melee.gg is temporarily unavailable\n"
             "If running in a restricted environment, run this script locally instead.\n"
         )
+
+    if locality is not None:
+        print(f"Filtering {len(tournaments)} tournament(s) by locality (fetching venue data)...")
+        tournaments = filter_tournaments_by_locality(tournaments, locality, args.verbose)
 
     if not tournaments:
         locality_hint = (
@@ -1080,10 +1169,7 @@ def main() -> None:
 
     print(f"Found {len(tournaments)} qualifying tournament(s):\n")
     for t in sorted(tournaments, key=_t_date):
-        loc = ""
-        if locality is not None:
-            place = _t_location(t)
-            loc = f"  [{t.get('_distance_mi', 0):.0f}mi{' · ' + place if place else ''}]"
+        loc = f"  [{t['_distance_mi']:.0f}mi]" if "_distance_mi" in t else ""
         print(f"  • {_t_name(t):<55}  {_t_players(t):>4} players  {_t_date(t)}{loc}")
 
     if args.dry_run:
