@@ -57,6 +57,16 @@ _ARCH_COLORS = [
 ]
 _OTHER_COLOR = "BFBFBF"    # gray for the "Other" bucket
 
+# Internal key for the catch-all bucket; the spreadsheet/chart show a fuller
+# label so the row reads as a deck grouping rather than an aggregation/total row.
+OTHER_KEY = "Other"
+OTHER_DISPLAY = "Other (all remaining decks)"
+
+
+def display_archetype(arch: str) -> str:
+    """Human-facing label for an archetype, expanding the 'Other' bucket."""
+    return OTHER_DISPLAY if arch == OTHER_KEY else arch
+
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 _HTTP_CACHE: Dict[str, object] = {}
@@ -714,7 +724,7 @@ def _build_data_sheet_xml(
         is_other = arch == "Other"
         lbl_style = _S_OTHER_LBL if is_other else _S_ROW_LABEL
         num_style = _S_OTHER_NUM if is_other else _S_NUMBER
-        cells = [_cell(f"A{ri}", arch, lbl_style)]
+        cells = [_cell(f"A{ri}", display_archetype(arch), lbl_style)]
         for ci, week in enumerate(weeks, start=2):
             val = round(shares.get(arch, {}).get(week, 0.0), 4)
             cells.append(_cell(f"{_col_letter(ci)}{ri}", val, num_style))
@@ -797,7 +807,7 @@ def _build_chart_xml(
             f'<c:strRef>'
             f'<c:f>{name_f}</c:f>'
             f'<c:strCache>'
-            f'<c:ptCount val="1"/><c:pt idx="0"><c:v>{_xe(arch)}</c:v></c:pt>'
+            f'<c:ptCount val="1"/><c:pt idx="0"><c:v>{_xe(display_archetype(arch))}</c:v></c:pt>'
             f'</c:strCache>'
             f'</c:strRef>'
             f'</c:tx>'
