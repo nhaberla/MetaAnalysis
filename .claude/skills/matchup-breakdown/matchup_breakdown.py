@@ -13,8 +13,11 @@ Usage:
 """
 
 import argparse
+import hashlib
 import io
 import json
+import os
+import pathlib
 import re
 import sys
 import time
@@ -35,12 +38,46 @@ REQUEST_DELAY = 1.0        # seconds between requests (respects robots.txt crawl
 MIN_PLAYERS_DEFAULT = 32   # matches swu-competitivehub.com filter standard
 LOW_SAMPLE_THRESHOLD = 20  # matchups below this count get an asterisk
 
+# Disk cache: persists round-match and tournament-page data across re-runs so a
+# timed-out run can resume without re-fetching already-retrieved pages.
+CACHE_DIR = pathlib.Path(
+    os.environ.get("SWU_CACHE_DIR", str(pathlib.Path.home() / ".cache" / "swu-matchup"))
+)
+CACHE_TTL_HOURS = 48  # tournament data is immutable; 48 h covers multi-run sessions
+
 # DataTables column names used by /Match/GetRoundMatches (must match pairings-section.min.js)
 _MATCH_COLUMNS = ["TableNumber", "PodNumber", "Teams", "Decklists", "ResultString"]
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 _HTTP_CACHE: Dict[str, object] = {}
+
+
+def _cache_path(key: str) -> pathlib.Path:
+    h = hashlib.sha1(key.encode()).hexdigest()[:16]
+    return CACHE_DIR / f"{h}.json"
+
+
+def _cache_read(key: str) -> Optional[object]:
+    p = _cache_path(key)
+    try:
+        if not p.exists():
+            return None
+        if (time.time() - p.stat().st_mtime) / 3600 > CACHE_TTL_HOURS:
+            return None
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _cache_write(key: str, data: object) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_path(key).write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+
 _BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -55,6 +92,12 @@ def _get_html(path: str, verbose: bool = False) -> str:
     url = MELEE_BASE + path
     if url in _HTTP_CACHE:
         return _HTTP_CACHE[url]  # type: ignore[return-value]
+    cached = _cache_read(url)
+    if cached is not None:
+        if verbose:
+            print(f"  [disk-cache] GET {url}", file=sys.stderr)
+        _HTTP_CACHE[url] = cached
+        return cached  # type: ignore[return-value]
     time.sleep(REQUEST_DELAY)
     if verbose:
         print(f"  GET {url}", file=sys.stderr)
@@ -66,6 +109,7 @@ def _get_html(path: str, verbose: bool = False) -> str:
     with urllib.request.urlopen(req, timeout=20) as r:
         html = r.read().decode("utf-8", errors="replace")
     _HTTP_CACHE[url] = html
+    _cache_write(url, html)
     return html
 
 
@@ -260,6 +304,12 @@ def fetch_swiss_round_ids(tournament_id: int, verbose: bool) -> Tuple[List[str],
 
 def fetch_round_matches(round_id: str, verbose: bool) -> List[dict]:
     """Fetch all matches for a round via POST /Match/GetRoundMatches/{roundId}."""
+    cache_key = f"round:{round_id}"
+    cached = _cache_read(cache_key)
+    if cached is not None:
+        if verbose:
+            print(f"  [disk-cache] round {round_id} ({len(cached)} matches)", file=sys.stderr)
+        return cached  # type: ignore[return-value]
     all_matches: List[dict] = []
     start = 0
     while True:
@@ -271,6 +321,7 @@ def fetch_round_matches(round_id: str, verbose: bool) -> List[dict]:
         if len(all_matches) >= total or not batch:
             break
         start += 250
+    _cache_write(cache_key, all_matches)
     return all_matches
 
 
@@ -778,6 +829,8 @@ def main() -> None:
         )
 
     # ── Fetch tournaments ──────────────────────────────────────────────────────
+    if args.verbose:
+        print(f"Disk cache: {CACHE_DIR}  (TTL {CACHE_TTL_HOURS}h)", file=sys.stderr)
     print(f"Fetching SWU tournaments: {start_date} → {end_date}  (min {args.min_players} players)...")
 
     try:
