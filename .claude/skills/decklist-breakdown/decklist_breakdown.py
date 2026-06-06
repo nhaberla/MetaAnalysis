@@ -365,8 +365,12 @@ def collect_field(tournaments: List[dict], verbose: bool) -> List[Entry]:
                 entries.append(Entry(tid, tname, c.get("PlayerId"), did, pair[0], pair[1]))
                 added += 1
 
-        # Top-cut decklist IDs → flag top finishers.
-        for rid in topcut_ids:
+        # Top-cut decklist IDs → flag top finishers. Only the FIRST elimination
+        # round is needed: its bracket already contains every top-cut competitor
+        # (e.g. a Top 8's opening round is 4 matches = all 8 players), so later
+        # rounds are redundant subsets. Fetching just one keeps request volume
+        # manageable on large (multi-event) windows.
+        for rid in topcut_ids[:1]:
             try:
                 tc_matches = fetch_round_matches(rid, verbose)
             except Exception:  # noqa: BLE001
